@@ -838,10 +838,10 @@ pub const ModelConfig = struct {
 
     /// Which `partial_rotary_factor` the YaRN table covers: laguna/gemma4 scale
     /// only their full-attention layers and spell that one
-    /// `partial_rotary_factor_global`; every other YaRN arch (qwen4_exp) has a
+    /// `partial_rotary_factor_global`; the Qwen YaRN architectures have a
     /// single rope for the whole trunk.
     pub fn yarnPartial(self: *const ModelConfig) f32 {
-        return if (self.isQwen4()) self.partial_rotary_factor else self.partial_rotary_factor_global;
+        return if (self.isQwen4() or std.mem.startsWith(u8, self.model_type, "qwen3_5")) self.partial_rotary_factor else self.partial_rotary_factor_global;
     }
 
     /// `int(head_dim × yarnPartial())` — the rotating slice of a head, i.e. the
@@ -2899,6 +2899,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         try parseQwenVisionFields(&config, root, cfg_obj);
+        try parseYarnRopeParameters(&config, cfg_obj);
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
     {
@@ -9074,6 +9075,31 @@ const QWEN4_YARN =
     \\  }
     \\}
 ;
+
+test "parseConfigFromJson: qwen35 YaRN enables scaled multimodal positions" {
+    const source =
+        \\{"model_type":"qwen3_5","text_config":{
+        \\"hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":16,
+        \\"num_key_value_heads":4,"head_dim":256,"max_position_embeddings":1048576,
+        \\"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\"original_max_position_embeddings":262144,"rope_theta":10000000,
+        \\"partial_rotary_factor":0.25,"mrope_interleaved":true,
+        \\"mrope_section":[11,11,10]}}}
+    ;
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text" }) |tag| {
+        const text = try std.mem.replaceOwned(u8, testing.allocator, source, "qwen3_5", tag);
+        defer testing.allocator.free(text);
+        const c = try parseConfigFromJson(testing.allocator, text);
+        try testing.expect(c.rope_yarn);
+        try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-6);
+        try testing.expectEqual(@as(u32, 262144), c.yarn_orig_max_pos);
+        try testing.expectEqual(@as(u32, 1048576), c.contextCap());
+        try testing.expectApproxEqAbs(@as(f32, 1.138629436), c.yarn_attention_factor, 1e-6);
+        try testing.expectEqual([3]u32{ 11, 11, 10 }, c.mrope_section);
+        try testing.expect(c.mrope_interleaved);
+        try testing.expectEqual(@as(u32, 64), c.yarnRotaryDim());
+    }
+}
 
 test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576" {
     const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
