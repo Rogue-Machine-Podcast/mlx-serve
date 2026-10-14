@@ -28897,6 +28897,55 @@ pub const Transformer = struct {
         k.* = ks;
     }
 
+    /// Scalar-offset RoPE for a consumer outside the trunk's layer loop (the
+    /// MTP head's text-only q/k). Same spectrum and mscale as the trunk's
+    /// composed full-attention arm: under YaRN the scaled denominator array
+    /// replaces the base (`has_value` flips) and the `[head_dim]` mscale table
+    /// scales the rotated slice; an unscaled model gets the plain `rope_theta`
+    /// call this replaced, unchanged. Runs on the caller's stream; the result
+    /// is owned by the caller. `x` must be head_dim wide (the mscale table is).
+    pub fn ropeAtScalarOffset(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, offset: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+        const use_yarn = self.yarnActive();
+        var roped = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(roped);
+        try mlx.check(mlx.mlx_fast_rope(&roped, x, rope_dims, false, self.trunkRopeBase(), 1.0, offset, self.trunkRopeFreqs(), s));
+        if (!use_yarn) return roped;
+        return self.trunkRopeMscale(x, roped, s);
+    }
+
+    /// `ropeAtScalarOffset` with one offset per batch row (`offsets` [B],
+    /// int32) — the batched MTP head's lanes.
+    pub fn ropeAtLaneOffsets(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, offsets: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        const use_yarn = self.yarnActive();
+        var roped = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(roped);
+        try mlx.check(mlx.mlx_fast_rope_dynamic(&roped, x, rope_dims, false, self.trunkRopeBase(), 1.0, offsets, self.trunkRopeFreqs(), s));
+        if (!use_yarn) return roped;
+        return self.trunkRopeMscale(x, roped, s);
+    }
+
+    /// mlx_fast_rope takes a base OR a freqs array: YaRN hands it the scaled
+    /// denominators, everything else the plain `rope_theta` base.
+    fn trunkRopeBase(self: *const Transformer) mlx.mlx_optional_float {
+        return .{ .value = self.config.rope_theta, .has_value = !self.yarnActive() };
+    }
+
+    fn trunkRopeFreqs(self: *const Transformer) mlx.mlx_array {
+        return if (self.yarnActive()) self.rope_freqs_yarn.? else .{ .ctx = null };
+    }
+
+    /// YaRN mscale on a rope'd head_dim-wide array, in its own dtype. Takes
+    /// ownership of `roped` and returns the scaled array.
+    fn trunkRopeMscale(self: *Transformer, x: mlx.mlx_array, roped: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        std.debug.assert(mlx.getShape(x)[3] == @as(c_int, @intCast(self.config.head_dim)));
+        defer _ = mlx.mlx_array_free(roped);
+        const ms = try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(roped), &self.yarn_mscale_cast, s);
+        var scaled = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scaled);
+        try mlx.check(mlx.mlx_multiply(&scaled, roped, ms, s));
+        return scaled;
+    }
+
     /// YaRN mscale on a rope'd array whose last dim may not be `head_dim`
     /// (the QSA indexer is 128-wide / 64 rotated). Slice the first `rope_dims`,
     /// multiply by a same-dtype scalar, concat the pass-through tail. NEVER
@@ -37603,7 +37652,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\  float l = float(logits[rbase + e]);
             \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
+        ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,
@@ -54527,6 +54576,307 @@ test "ropeAtPositions YaRN: cos/sin carry mscale on the rotated slice" {
     for (64..256) |i| try testing.expectEqual(uv[i], sv[i]);
 }
 
+// ── MTP head rope under YaRN (ROG-410) ──
+// The MTP head rotates its own q/k outside the trunk's layer loop. Before this
+// change its text-only arms called `mlx_fast_rope(rope_theta)` — no YaRN
+// denominators, no mscale — so on a YaRN-scaled checkpoint the head attended
+// with a different positional geometry than the trunk whose hiddens it reads.
+// These pin `ropeAtScalarOffset` / `ropeAtLaneOffsets` (what the head now
+// calls) to the trunk's composed arm bit-for-bit and to a host f64 reference
+// through position 1,048,575, and pin the pre-change call as divergent.
+
+/// The qwythos-yarn4x geometry: qwen3_5_moe, head_dim 256 with 64 rotary
+/// dims, theta 1e7, YaRN factor 4 over a 262,144 window, HF default mscale.
+fn qwen35YarnConfig() ModelConfig {
+    var c = ModelConfig{};
+    c.model_type = "qwen3_5_moe";
+    c.head_dim = 256;
+    c.partial_rotary_factor = 0.25;
+    c.rope_theta = 10_000_000.0;
+    c.rope_yarn = true;
+    c.yarn_factor = 4.0;
+    c.yarn_orig_max_pos = 262_144;
+    c.yarn_beta_fast = 32.0;
+    c.yarn_beta_slow = 1.0;
+    c.yarn_attention_factor = 1.138629436;
+    return c;
+}
+
+const MtpYarnFixture = struct {
+    t: Transformer,
+
+    /// Builds the three YaRN tables the way `Transformer` load does (freqs
+    /// from computeYarnFreqs, inv_freq from yarnSpec, the [head_dim] mscale
+    /// vector) — two independent derivations of one spectrum.
+    fn init(c: ModelConfig, s: mlx.mlx_stream) !MtpYarnFixture {
+        var f: MtpYarnFixture = .{ .t = undefined };
+        f.t.rht = null;
+        f.t.s = s;
+        f.t.allocator = testing.allocator;
+        f.t.config = c;
+        f.t.yarn_mscale_cast = .{};
+        f.t.rope_freqs_yarn = null;
+        f.t.yarn_mscale = null;
+        f.t.yarn_inv_freq = null;
+        if (!c.rope_yarn) return f;
+        const rotary: u32 = c.yarnRotaryDim();
+        const half: usize = rotary / 2;
+        const den = try testing.allocator.alloc(f64, half);
+        defer testing.allocator.free(den);
+        computeYarnFreqs(den, c.head_dim, c.yarnPartial(), c.rope_theta, c.yarn_factor, c.yarn_beta_fast, c.yarn_beta_slow, c.yarn_orig_max_pos, c.yarn_truncate);
+        const den32 = try testing.allocator.alloc(f32, half);
+        defer testing.allocator.free(den32);
+        for (den, 0..) |v, i| den32[i] = @floatCast(v);
+        f.t.rope_freqs_yarn = mlx.mlx_array_new_data(den32.ptr, &[_]c_int{@intCast(half)}, 1, .float32);
+        const inv = try testing.allocator.alloc(f64, half);
+        yarnSpec(&c).invFreq(inv);
+        f.t.yarn_inv_freq = inv;
+        const ms = try testing.allocator.alloc(f32, c.head_dim);
+        defer testing.allocator.free(ms);
+        for (ms, 0..) |*m, i| m.* = if (i < rotary) c.yarn_attention_factor else 1.0;
+        f.t.yarn_mscale = mlx.mlx_array_new_data(ms.ptr, &[_]c_int{@intCast(c.head_dim)}, 1, .float32);
+        return f;
+    }
+
+    fn deinit(self: *MtpYarnFixture) void {
+        if (self.t.rope_freqs_yarn) |a| _ = mlx.mlx_array_free(a);
+        if (self.t.yarn_mscale) |a| _ = mlx.mlx_array_free(a);
+        if (self.t.yarn_inv_freq) |a| testing.allocator.free(a);
+        self.t.yarn_mscale_cast.deinit();
+    }
+};
+
+const MTP_YARN_H: usize = 2;
+const MTP_YARN_L: usize = 3;
+const MTP_YARN_HD: usize = 256;
+/// Window edges, the YaRN window boundary, and the last addressable position
+/// (`p + L - 1` = 1,048,575 for the final entry).
+const MTP_YARN_POSITIONS = [_]c_int{ 0, 4093, 262_141, 262_144, 524_287, 999_999, 1_048_573 };
+
+/// Deterministic, non-degenerate q/k-like input [1, H, L, head_dim].
+fn mtpYarnInput(buf: *[MTP_YARN_H * MTP_YARN_L * MTP_YARN_HD]f32) mlx.mlx_array {
+    for (buf, 0..) |*v, i| {
+        const fi: f32 = @floatFromInt(i);
+        v.* = @sin(fi * 0.37 + 0.11) * (1.0 + @as(f32, @floatFromInt(i % 7)) * 0.25);
+    }
+    const shape = [_]c_int{ 1, @intCast(MTP_YARN_H), @intCast(MTP_YARN_L), @intCast(MTP_YARN_HD) };
+    return mlx.mlx_array_new_data(buf, &shape, 4, .float32);
+}
+
+fn mtpYarnRead(arr: mlx.mlx_array, s: mlx.mlx_stream, out: []f32) !void {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const d = mlx.mlx_array_data_float32(f).?;
+    @memcpy(out, d[0..out.len]);
+}
+
+/// Worst element error of `got` against a host f64 NeoX rope at positions
+/// `p..p+L-1`, normalised by a per-dim f32 bound: mlx forms each angle as an
+/// f32 product (~2.5e-7 relative), so dim j at position q may move by
+/// |x|·ms·q·inv_j·2.5e-7 plus sin/cos rounding. <= 1.0 means "the YaRN
+/// geometry, up to f32 angle rounding"; the plain-theta rope lands far above.
+fn mtpYarnRefError(c: ModelConfig, inv: []const f64, x: []const f32, got: []const f32, p: c_int) f64 {
+    const rotary: usize = c.yarnRotaryDim();
+    const half = rotary / 2;
+    const ms: f64 = c.yarn_attention_factor;
+    var worst: f64 = 0;
+    for (0..MTP_YARN_H) |h| {
+        for (0..MTP_YARN_L) |l| {
+            const row = (h * MTP_YARN_L + l) * MTP_YARN_HD;
+            const pos: f64 = @floatFromInt(@as(i64, p) + @as(i64, @intCast(l)));
+            var xmax: f64 = 0;
+            for (0..MTP_YARN_HD) |d| xmax = @max(xmax, @abs(@as(f64, x[row + d])));
+            for (0..half) |j| {
+                const ang = pos * inv[j];
+                const cs = @cos(ang);
+                const sn = @sin(ang);
+                const a: f64 = x[row + j];
+                const b: f64 = x[row + j + half];
+                const want_a = ms * (a * cs - b * sn);
+                const want_b = ms * (b * cs + a * sn);
+                const tol = 1e-5 + 2.0 * ms * xmax * (pos * inv[j] * 2.5e-7 + 1e-6);
+                worst = @max(worst, @abs(want_a - got[row + j]) / tol);
+                worst = @max(worst, @abs(want_b - got[row + j + half]) / tol);
+            }
+            for (rotary..MTP_YARN_HD) |d| {
+                worst = @max(worst, @abs(@as(f64, x[row + d]) - got[row + d]) / 1e-6);
+            }
+        }
+    }
+    return worst;
+}
+
+test "MTP rope under YaRN is bit-identical to the trunk's composed arm" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var fx = try MtpYarnFixture.init(qwen35YarnConfig(), s);
+    defer fx.deinit();
+    try testing.expect(fx.t.yarnActive());
+    try testing.expectEqual(@as(u32, 64), fx.t.config.yarnRotaryDim());
+
+    var buf: [MTP_YARN_H * MTP_YARN_L * MTP_YARN_HD]f32 = undefined;
+    const x = mtpYarnInput(&buf);
+    defer _ = mlx.mlx_array_free(x);
+    const n = buf.len;
+    const got = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(got);
+    const want = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(want);
+
+    for (MTP_YARN_POSITIONS) |p| {
+        const head = try fx.t.ropeAtScalarOffset(x, 64, p, s);
+        defer _ = mlx.mlx_array_free(head);
+        // The trunk's spelling (qwen3.5 composed full-attention arm): freqs
+        // replace the base, then yarnScaleQK on q and k.
+        var q = mlx.mlx_array_new();
+        var k = mlx.mlx_array_new();
+        const base = mlx.mlx_optional_float{ .value = fx.t.config.rope_theta, .has_value = false };
+        try mlx.check(mlx.mlx_fast_rope(&q, x, 64, false, base, 1.0, p, fx.t.rope_freqs_yarn.?, s));
+        try mlx.check(mlx.mlx_fast_rope(&k, x, 64, false, base, 1.0, p, fx.t.rope_freqs_yarn.?, s));
+        try fx.t.yarnScaleQK(&q, &k);
+        defer _ = mlx.mlx_array_free(q);
+        defer _ = mlx.mlx_array_free(k);
+        try mtpYarnRead(head, s, got);
+        try mtpYarnRead(q, s, want);
+        try testing.expectEqualSlices(f32, want, got);
+        try mtpYarnRead(k, s, want);
+        try testing.expectEqualSlices(f32, want, got);
+    }
+}
+
+test "MTP rope under YaRN matches the host f64 reference through position 1,048,575" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const c = qwen35YarnConfig();
+    var fx = try MtpYarnFixture.init(c, s);
+    defer fx.deinit();
+
+    var buf: [MTP_YARN_H * MTP_YARN_L * MTP_YARN_HD]f32 = undefined;
+    const x = mtpYarnInput(&buf);
+    defer _ = mlx.mlx_array_free(x);
+    const got = try testing.allocator.alloc(f32, buf.len);
+    defer testing.allocator.free(got);
+
+    for (MTP_YARN_POSITIONS) |p| {
+        const head = try fx.t.ropeAtScalarOffset(x, 64, p, s);
+        defer _ = mlx.mlx_array_free(head);
+        try mtpYarnRead(head, s, got);
+        const err = mtpYarnRefError(c, fx.t.yarn_inv_freq.?, &buf, got, p);
+        if (err > 1.0) std.debug.print("position {d}: normalised error {d:.3}\n", .{ p, err });
+        try testing.expect(err <= 1.0);
+    }
+}
+
+test "MTP rope before ROG-410 (plain rope_theta) diverges from the YaRN reference" {
+    // Red guard: the call the head used to make. It drops the mscale (a 13.9%
+    // magnitude miss at every position, including 0) and the interpolated
+    // low-frequency band (a 4x angle miss that grows with position), so the
+    // reference check above must reject it everywhere.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const c = qwen35YarnConfig();
+    var fx = try MtpYarnFixture.init(c, s);
+    defer fx.deinit();
+
+    var buf: [MTP_YARN_H * MTP_YARN_L * MTP_YARN_HD]f32 = undefined;
+    const x = mtpYarnInput(&buf);
+    defer _ = mlx.mlx_array_free(x);
+    const got = try testing.allocator.alloc(f32, buf.len);
+    defer testing.allocator.free(got);
+
+    for (MTP_YARN_POSITIONS) |p| {
+        var old = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(old);
+        try mlx.check(mlx.mlx_fast_rope(&old, x, 64, false, mlx.mlx_optional_float.some(c.rope_theta), 1.0, p, .{ .ctx = null }, s));
+        try mtpYarnRead(old, s, got);
+        try testing.expect(mtpYarnRefError(c, fx.t.yarn_inv_freq.?, &buf, got, p) > 10.0);
+    }
+}
+
+test "MTP rope without YaRN is the plain rope_theta call, bit-for-bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var c = qwen35YarnConfig();
+    c.rope_yarn = false;
+    var fx = try MtpYarnFixture.init(c, s);
+    defer fx.deinit();
+    try testing.expect(!fx.t.yarnActive());
+
+    var buf: [MTP_YARN_H * MTP_YARN_L * MTP_YARN_HD]f32 = undefined;
+    const x = mtpYarnInput(&buf);
+    defer _ = mlx.mlx_array_free(x);
+    const got = try testing.allocator.alloc(f32, buf.len);
+    defer testing.allocator.free(got);
+    const want = try testing.allocator.alloc(f32, buf.len);
+    defer testing.allocator.free(want);
+
+    for ([_]c_int{ 0, 4093, 262_141 }) |p| {
+        const head = try fx.t.ropeAtScalarOffset(x, 64, p, s);
+        defer _ = mlx.mlx_array_free(head);
+        var old = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(old);
+        try mlx.check(mlx.mlx_fast_rope(&old, x, 64, false, mlx.mlx_optional_float.some(c.rope_theta), 1.0, p, .{ .ctx = null }, s));
+        try mtpYarnRead(head, s, got);
+        try mtpYarnRead(old, s, want);
+        try testing.expectEqualSlices(f32, want, got);
+    }
+}
+
+test "batched MTP lanes rope at their own offsets like the single-lane head" {
+    // ropeAtLaneOffsets: lanes on the batch axis, one offset each (the
+    // batched head's `lanes_first` layout [lanes, H, 1, D]).
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var fx = try MtpYarnFixture.init(qwen35YarnConfig(), s);
+    defer fx.deinit();
+
+    const lanes = 3;
+    var data: [lanes * MTP_YARN_H * MTP_YARN_HD]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.21 + 0.5);
+    const x = mlx.mlx_array_new_data(&data, &[_]c_int{ lanes, @intCast(MTP_YARN_H), 1, @intCast(MTP_YARN_HD) }, 4, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var offs = [_]i32{ 7, 262_144, 1_048_575 };
+    const off_arr = mlx.mlx_array_new_data(&offs, &[_]c_int{lanes}, 1, .int32);
+    defer _ = mlx.mlx_array_free(off_arr);
+
+    const batched = try fx.t.ropeAtLaneOffsets(x, 64, off_arr, s);
+    defer _ = mlx.mlx_array_free(batched);
+    var all: [lanes * MTP_YARN_H * MTP_YARN_HD]f32 = undefined;
+    try mtpYarnRead(batched, s, &all);
+
+    const lane_len = MTP_YARN_H * MTP_YARN_HD;
+    for (0..lanes) |k| {
+        const one = mlx.mlx_array_new_data(data[k * lane_len ..].ptr, &[_]c_int{ 1, @intCast(MTP_YARN_H), 1, @intCast(MTP_YARN_HD) }, 4, .float32);
+        defer _ = mlx.mlx_array_free(one);
+        const single = try fx.t.ropeAtScalarOffset(one, 64, offs[k], s);
+        defer _ = mlx.mlx_array_free(single);
+        var want: [lane_len]f32 = undefined;
+        try mtpYarnRead(single, s, &want);
+        for (0..lane_len) |i| try testing.expectApproxEqAbs(want[i], all[k * lane_len + i], 1e-5);
+    }
+}
+
+test "MTP rope under YaRN keeps a bf16 activation in bf16" {
+    // The f32 mscale table must be narrowed (constTableAs), or the f32
+    // product would ride SDPA and o_proj and upcast every downstream read.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var fx = try MtpYarnFixture.init(qwen35YarnConfig(), s);
+    defer fx.deinit();
+
+    var buf: [MTP_YARN_H * MTP_YARN_L * MTP_YARN_HD]f32 = undefined;
+    const x32 = mtpYarnInput(&buf);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+    const head = try fx.t.ropeAtScalarOffset(x, 64, 999_999, s);
+    defer _ = mlx.mlx_array_free(head);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(head));
+}
+
 test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
     // The QSA indexer is 128-wide with 64 rotary dims. mlx_fast_rope scale
     // stays 1.0 (never the mscale); yarnScaleRotated then scales the rotated
@@ -65099,8 +65449,8 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     var arrs: [14]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{
-        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
-        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len, c_dim },     &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim },            &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },         &.{hv},                   &.{hv},             &.{128},            &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
         &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
     };
     for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
@@ -74399,35 +74749,35 @@ test "glm5_next verify windows of 2..16 rows track the same rows decoded one at 
     };
     // A short tail chunk of a prefix-cache restore is a prefill, not a verify: both modes ride the same rows.
     for ([_]bool{ true, false }) |mode_verify| {
-    var w: usize = 2;
-    while (w <= 16) : (w += 1) {
-        const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
-        // The window in one forward.
-        try xfm.resetCache();
-        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-        const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
-        defer _ = mlx.mlx_array_free(got_arr);
-        const got = try qwen4ReadF32(allocator, got_arr, s);
-        defer allocator.free(got);
-        // The same rows one at a time.
-        try xfm.resetCache();
-        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-        var worst: f64 = 1.0;
-        var misses: usize = 0;
-        for (0..w) |r| {
-            const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
-            defer _ = mlx.mlx_array_free(one);
-            const want = try qwen4ReadF32(allocator, one, s);
-            defer allocator.free(want);
-            const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
-            worst = @min(worst, cmp.min_cos);
-            misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+        var w: usize = 2;
+        while (w <= 16) : (w += 1) {
+            const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
+            // The window in one forward.
+            try xfm.resetCache();
+            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+            const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
+            defer _ = mlx.mlx_array_free(got_arr);
+            const got = try qwen4ReadF32(allocator, got_arr, s);
+            defer allocator.free(got);
+            // The same rows one at a time.
+            try xfm.resetCache();
+            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+            var worst: f64 = 1.0;
+            var misses: usize = 0;
+            for (0..w) |r| {
+                const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
+                defer _ = mlx.mlx_array_free(one);
+                const want = try qwen4ReadF32(allocator, one, s);
+                defer allocator.free(want);
+                const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+                worst = @min(worst, cmp.min_cos);
+                misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+            }
+            std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
+            // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
+            // rows before the wide windows existed): a broken row path lands far below this.
+            try testing.expect(worst > 0.94);
         }
-        std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
-        // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
-        // rows before the wide windows existed): a broken row path lands far below this.
-        try testing.expect(worst > 0.94);
-    }
     }
 }
 

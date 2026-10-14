@@ -3350,7 +3350,11 @@ pub fn appendKvOnly(
             @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
         else
             rope_offset;
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+        // The trunk's spectrum and mscale (YaRN when the config scales), not a
+        // plain rope_theta call: the head reads hiddens the trunk produced
+        // under that geometry, and the M-RoPE arm above already carries it.
+        _ = mlx.mlx_array_free(k_rope);
+        k_rope = try target.ropeAtScalarOffset(k_t, rope_dims, effective_offset, s);
     }
 
     var kv_view = try cache.update(0, k_rope, v_t, s, 0);
@@ -3438,8 +3442,11 @@ pub fn forwardWithMrope(
             @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
         else
             rope_offset;
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, front.q_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, front.k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+        // Same rope as appendKvOnly: the trunk's spectrum and mscale.
+        _ = mlx.mlx_array_free(q_rope);
+        q_rope = try target.ropeAtScalarOffset(front.q_t, rope_dims, effective_offset, s);
+        _ = mlx.mlx_array_free(k_rope);
+        k_rope = try target.ropeAtScalarOffset(front.k_t, rope_dims, effective_offset, s);
     }
 
     var kv_view = try cache.update(0, k_rope, front.v_t, s, 0);
@@ -3566,7 +3573,9 @@ pub fn forwardLanes(self: *const MtpModel, target: *Transformer, lanes: []const 
             try mlx.check(mlx.mlx_array_set(out, by_lane));
             continue;
         }
-        try mlx.check(mlx.mlx_fast_rope_dynamic(out, by_lane, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, off_arr, .{ .ctx = null }, s));
+        // Per-lane offsets, same trunk spectrum and mscale as the single-lane path.
+        _ = mlx.mlx_array_free(out.*);
+        out.* = try target.ropeAtLaneOffsets(by_lane, rope_dims, off_arr, s);
     }
 
     const none_mask = mlx.mlx_array_new();
